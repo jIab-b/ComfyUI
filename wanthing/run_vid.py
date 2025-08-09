@@ -22,7 +22,7 @@ torch.backends.cudnn.benchmark = False
 torch.backends.cuda.matmul.allow_tf32 = False
 
 # Add ComfyUI to path - UPDATE THIS PATH
-COMFYUI_PATH = "~/ComfyUI"
+COMFYUI_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, COMFYUI_PATH)
 
 # Import ComfyUI components
@@ -30,9 +30,14 @@ import comfy.model_management as mm
 import comfy.utils
 import comfy.sd
 import comfy.model_patcher
+import comfy.ops
 
+from comfy import sd
+from comfy import supported_models_base
+from comfy.text_encoders.wan import WanT5Tokenizer, te as wan_te
+from comfy.text_encoders.sd3_clip import t5_xxl_detect
 
-from comfy.text_encoders.t5 import T5
+from comfy.text_encoders.wan import UMT5XXlModel
 
 # Setup logging
 logging.basicConfig(
@@ -201,47 +206,61 @@ class Wan21SequentialLoader:
         
         with memory_efficient_load("T5 Encoder"):
             try:
-                # Load T5 model
-                logger.info("Loading T5-XXL FP16 model...")
+                logger.info("Loading UMT5-XXL model...")
+                
                 t5_sd = comfy.utils.load_torch_file(
                     str(self.paths.t5_model),
                     safe_load=True
                 )
                 
-                # Create T5 model
-                t5_model = T5(
-                    t5_sd,
-                    device=mm.text_encoder_device(),
-                    dtype=mm.text_encoder_dtype(mm.text_encoder_device())
-                )
+                prefixed_sd = {}
+                for k, v in t5_sd.items():
+                    prefixed_sd[f"umt5xxl.{k}"] = v
                 
-                # Move to device with offloading
-                if self.config.CPU_OFFLOAD_ENABLED:
-                    t5_model = mm.load_model_gpu(t5_model)
+                t5_detect = t5_xxl_detect(prefixed_sd, "umt5xxl.transformer.")
+                clip_target = supported_models_base.ClipTarget(WanT5Tokenizer, wan_te(**t5_detect))
                 
-                logger.info("Encoding prompts with T5...")
+                parameters = comfy.utils.calculate_parameters(prefixed_sd)
                 
-                # Encode prompts
-                from comfy.sd import CLIPModel
+                device = mm.text_encoder_device()
+                dtype = mm.text_encoder_dtype(device)
                 
-                # Create tokenizer and encode
-                tokens = t5_model.tokenize(prompt)
-                negative_tokens = t5_model.tokenize(negative_prompt) if negative_prompt else None
+                model_options = {
+                    "dtype": dtype,
+                    "load_device": device,
+                    "offload_device": mm.text_encoder_offload_device()
+                }
                 
-                cond = t5_model.encode_from_tokens(tokens)
-                uncond = t5_model.encode_from_tokens(negative_tokens) if negative_tokens else torch.zeros_like(cond)
+                clip = sd.CLIP(clip_target, tokenizer_data=prefixed_sd, parameters=parameters, model_options=model_options)
                 
-                # Move embeddings to CPU immediately
+                m, u = clip.load_sd(prefixed_sd, full_model=True)
+                if len(m) > 0:
+                    m_filter = list(filter(lambda a: ".logit_scale" not in a and ".transformer.text_projection.weight" not in a, m))
+                    if len(m_filter) > 0:
+                        logger.warning(f"Missing keys in T5 model: {len(m_filter)} keys")
+                    else:
+                        logger.debug(f"T5 model loaded successfully, missing only optional keys")
+                
+                if len(u) > 0:
+                    logger.debug(f"Unexpected keys in T5 model: {len(u)} keys")
+                
+                logger.info("Encoding prompts with UMT5...")
+                
+                tokens = clip.tokenize(prompt)
+                negative_tokens = clip.tokenize(negative_prompt) if negative_prompt else None
+                
+                cond = clip.encode_from_tokens(tokens)
+                uncond = clip.encode_from_tokens(negative_tokens) if negative_tokens else torch.zeros_like(cond)
+                
                 cond_cpu = cond.cpu().clone()
                 uncond_cpu = uncond.cpu().clone()
                 
-                # Delete model completely
-                logger.info("Unloading T5 model...")
+                logger.info("Unloading UMT5 model...")
                 del cond, uncond, tokens, negative_tokens
-                del t5_model, t5_sd
+                del clip, prefixed_sd, t5_sd
                 
             except Exception as e:
-                logger.error(f"Failed to process T5: {e}")
+                logger.error(f"Failed to process UMT5: {e}")
                 raise
             
             return cond_cpu, uncond_cpu
@@ -527,7 +546,7 @@ def main():
     """Main execution function"""
     
     # Update this path to your ComfyUI installation
-    COMFYUI_PATH = "~/ComfyUI"
+    COMFYUI_PATH = os.path.expanduser("~/ComfyUI")
     
     # Initialize loader
     loader = Wan21SequentialLoader(comfyui_path=COMFYUI_PATH)
