@@ -10,6 +10,14 @@ homepage = "https://www.comfy.org/"
 repository = "https://github.com/comfyanonymous/ComfyUI"
 documentation = "https://docs.comfy.org/"
 
+
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["comfy*", "comfy_api*", "comfy_extras*"]
+namespaces = false
+
+
 [tool.ruff]
 lint.select = [
   "N805", # invalid-first-argument-name-for-method
