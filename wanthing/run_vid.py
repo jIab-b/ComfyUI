@@ -213,15 +213,20 @@ class Wan21SequentialLoader:
                     safe_load=True
                 )
                 
+                # Prefix keys so they match WanT5 implementation (umt5xxl.transformer.*)
                 prefixed_sd = {}
                 for k, v in t5_sd.items():
-                    prefixed_sd[f"umt5xxl.{k}"] = v
-                
+                    if k == "spiece_model":
+                        prefixed_sd["spiece_model"] = v
+                        prefixed_sd["umt5xxl." + k] = v
+                    else:
+                        prefixed_sd[f"umt5xxl.transformer.{k}"] = v
+
                 t5_detect = t5_xxl_detect(prefixed_sd, "umt5xxl.transformer.")
                 clip_target = supported_models_base.ClipTarget(WanT5Tokenizer, wan_te(**t5_detect))
-                
+
                 parameters = comfy.utils.calculate_parameters(prefixed_sd)
-                
+
                 device = mm.text_encoder_device()
                 dtype = mm.text_encoder_dtype(device)
                 
@@ -231,7 +236,8 @@ class Wan21SequentialLoader:
                     "offload_device": mm.text_encoder_offload_device()
                 }
                 
-                clip = sd.CLIP(clip_target, tokenizer_data=prefixed_sd, parameters=parameters, model_options=model_options)
+                tokenizer_data = {"spiece_model": prefixed_sd.get("spiece_model", None)}
+                clip = sd.CLIP(clip_target, tokenizer_data=tokenizer_data, parameters=parameters, model_options=model_options)
                 
                 m, u = clip.load_sd(prefixed_sd, full_model=True)
                 if len(m) > 0:
