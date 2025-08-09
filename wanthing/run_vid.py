@@ -181,10 +181,14 @@ class Wan21SequentialLoader:
         log_memory("Initial state:")
     
     def _setup_comfyui_memory_settings(self):
-        """Configure ComfyUI for low VRAM operation"""
-        # Force low VRAM mode
-        mm.vram_state = mm.VRAMState.LOW_VRAM
-        mm.set_vram_to = mm.VRAMState.LOW_VRAM
+        """Configure ComfyUI memory. Use GPU when it exists."""
+        if torch.cuda.is_available():
+            # allow text-encoder to live on GPU
+            mm.vram_state = mm.VRAMState.NORMAL_VRAM
+            mm.set_vram_to = mm.VRAMState.NORMAL_VRAM
+        else:
+            mm.vram_state = mm.VRAMState.LOW_VRAM
+            mm.set_vram_to = mm.VRAMState.LOW_VRAM
         
         # Enable CPU offloading
         mm.cpu_state = mm.CPUState.GPU
@@ -195,7 +199,7 @@ class Wan21SequentialLoader:
         # Configure for 8GB VRAM
         os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'max_split_size_mb:512'
         
-        logger.info("ComfyUI configured for low VRAM mode with CPU offloading")
+        logger.info(f"ComfyUI VRAM state: {mm.vram_state.name}")
     
     # ========================================================================
     # T5 Text Encoder
@@ -268,7 +272,8 @@ class Wan21SequentialLoader:
             except Exception as e:
                 logger.error(f"Failed to process UMT5: {e}")
                 raise
-            
+            import time; print('t5 done, sleeping')
+            time.sleep(10)
             return cond_cpu, uncond_cpu
     
     # ========================================================================
