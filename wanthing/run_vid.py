@@ -39,10 +39,11 @@ from comfy.text_encoders.sd3_clip import t5_xxl_detect
 
 from comfy.text_encoders.wan import UMT5XXlModel
 
-# Setup logging
+# Setup logging properly - remove duplicate handler
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[logging.StreamHandler(sys.stdout)]
 )
 logger = logging.getLogger(__name__)
 
@@ -293,24 +294,31 @@ class Wan21SequentialLoader:
         
         with memory_efficient_load("Transformer"):
             try:
-                # Load transformer model
+                # Load transformer model properly
                 logger.info("Loading Wan 2.1 1.3B FP16 transformer...")
+                
                 transformer_sd = comfy.utils.load_torch_file(
                     str(self.paths.transformer_model),
                     safe_load=True
                 )
                 
-                # Create model with offloading
-                model_config = self._get_model_config()
-                diffusion_model = comfy.sd.load_diffusion_model_state_dict(
-                    transformer_sd,
-                    model_config=model_config,
-                    dtype=torch.float16  # Force FP16 for 2060 Super
-                )
+                # Create proper model configuration using ComfyUI's native approach
+                from comfy.supported_models import WAN21_T2V
                 
-                # Create model patcher with CPU offloading
+                # Create unet config from our model config
+                unet_config = self._get_model_config()
+                model_config = WAN21_T2V(unet_config)
+                
+                # Create the actual model object
+                from comfy.model_base import WAN21, ModelType
+                model = WAN21(model_config, model_type=ModelType.FLOW)
+                
+                # Load the state dict into the model
+                model.diffusion_model.load_state_dict(transformer_sd, strict=False)
+                
+                # Create ModelPatcher with the actual model
                 model_patcher = comfy.model_patcher.ModelPatcher(
-                    diffusion_model,
+                    model.diffusion_model,
                     load_device=mm.get_torch_device(),
                     offload_device=mm.unet_offload_device() if self.config.CPU_OFFLOAD_ENABLED else None
                 )
@@ -322,38 +330,51 @@ class Wan21SequentialLoader:
                 
                 logger.info(f"Generating {num_frames} frames at {width}x{height}...")
                 
-                # Generate latents using ComfyUI's sampling
+                # Generate latents using ComfyUI's native sampling
                 from comfy.sample import sample
-                from comfy.samplers import KSampler
+                from comfy.latent_formats import Wan21
                 
-                # Create latent
+                # Create latent with proper format
+                latent_format = Wan21()
                 latent_height = height // 8
                 latent_width = width // 8
-                latent = torch.randn(
-                    1, 16, num_frames, latent_height, latent_width,
-                    dtype=torch.float16,
-                    device=device
+                
+                # Create latent tensor
+                latent = torch.zeros(1, 16, num_frames, latent_height, latent_width, 
+                                   dtype=torch.float16, device=device)
+                
+                # Process through latent format
+                latent = latent_format.process_in(latent)
+                
+                # Setup conditionings properly
+                positive = [{'embeds': text_embeddings}]
+                negative = [{'embeds': negative_embeddings}]
+                
+                # Sample using ComfyUI's native sampler
+                samples = sample(
+                    model_patcher,
+                    latent,
+                    steps=steps,
+                    cfg=cfg_scale,
+                    sampler_name='dpmpp_2m_sde',
+                    scheduler='karras',
+                    positive=positive,
+                    negative=negative,
+                    denoise=1.0,
+                    seed=seed
                 )
                 
-                # Setup sampler
-                if seed == -1:
-                    seed = torch.randint(0, 2**32, (1,)).item()
-                
-                # Sample with model
-                model_patcher.model_patches_to(device)
-                
-                # This is simplified - actual sampling would need proper ComfyUI sampler setup
-                # For production, integrate with ComfyUI's KSampler properly
-                noise = latent.clone()
+                # Process output through latent format
+                samples = latent_format.process_out(samples)
                 
                 # Move result to CPU
-                latent_cpu = latent.cpu().clone()
+                latent_cpu = samples.cpu().clone()
                 
-                # Unload transformer completely
+                # Force cleanup between phases
                 logger.info("Unloading transformer model...")
-                model_patcher.unpatch_model()
-                del model_patcher, diffusion_model, transformer_sd
-                del latent, noise, text_embeddings, negative_embeddings
+                del model_patcher, model, positive, negative, samples, latent
+                del text_embeddings, negative_embeddings
+                force_cleanup()
                 
             except Exception as e:
                 logger.error(f"Failed to generate with transformer: {e}")
@@ -382,7 +403,7 @@ class Wan21SequentialLoader:
     # VAE Decoder
     # ========================================================================
     
-    def load_and_decode_vae(self, latents: torch.Tensor) -> torch.Tensor:
+    def load_and_decode_vae(self, latents: torch.Tensor, height: int = 512, width: int = 512) -> torch.Tensor:
         """Load VAE, decode latents, then completely unload"""
         
         with memory_efficient_load("VAE"):
@@ -432,7 +453,7 @@ class Wan21SequentialLoader:
                 video_frames = torch.cat(decoded_frames, dim=0)
                 
                 # Reshape back to video format
-                video_frames = video_frames.reshape(1, end_idx, 3, height, width)
+                video_frames = video_frames.reshape(1, num_frames, 3, height, width)
                 
                 # Ensure on CPU
                 video_frames_cpu = video_frames.cpu().clone()
@@ -483,6 +504,7 @@ class Wan21SequentialLoader:
             text_embeddings, negative_embeddings = self.load_and_encode_t5(
                 prompt, negative_prompt
             )
+            force_cleanup()
             logger.info(f"Text embeddings shape: {text_embeddings.shape}")
             
             # Phase 2: Latent Generation with Transformer
@@ -499,6 +521,7 @@ class Wan21SequentialLoader:
                 steps=steps,
                 seed=seed
             )
+           
             logger.info(f"Latents shape: {latents.shape}")
             
             # Clean up embeddings
@@ -509,7 +532,7 @@ class Wan21SequentialLoader:
             logger.info("\n" + "="*40)
             logger.info("PHASE 3: Video Decoding (VAE)")
             logger.info("="*40)
-            video_frames = self.load_and_decode_vae(latents)
+            video_frames = self.load_and_decode_vae(latents, height=height, width=width)
             logger.info(f"Video frames shape: {video_frames.shape}")
             
             # Clean up latents
